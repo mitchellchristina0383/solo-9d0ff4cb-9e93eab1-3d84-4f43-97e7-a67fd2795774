@@ -9,7 +9,11 @@
   4. 等待首包时退订 -> 上游不再发该频道包
   5. 加入失败 -> 继续收旧台
   6. 两台同时等待同一频道首包 -> 仍只一路订阅, 首包到达同时切换
-  7. 结束时不存在残留的上游订阅
+  7. 共享缓存: 同看一个频道时节目包只存一份, 每台的未读进度记录不随积压增长
+  8. 快慢读互不影响: 快读读走只影响本机, 慢读随后仍能读到同样的包; 读净后缓存释放
+  9. 换台/退订后仍能读取旧包, 他人读包不会提前清掉; 跨频道按到包顺序返回
+ 10. MAX_QUEUE 限制本机全部未读包, 超限丢本机最早的包, 不影响其他机顶盒
+ 11. 结束时不存在残留的上游订阅与节目包缓存
 """
 
 from __future__ import annotations
@@ -66,6 +70,18 @@ def drain(sid: str) -> list[dict]:
 
 def source_state() -> dict:
     return httpx.get(f"{SOURCE}/state", timeout=5).json()
+
+
+def proxy_state() -> dict:
+    return httpx.get(f"{PROXY}/state", timeout=5).json()
+
+
+def drain_aligned(*sids: str) -> None:
+    """反复清空各台未读, 直到同一轮内都没有新包 (对齐各台未读起点)."""
+    for _ in range(50):
+        if all(not drain(s) for s in sids):
+            return
+    raise AssertionError(f"无法对齐 {sids} 的未读起点")
 
 
 def source_config(channel: int, **kw) -> None:
@@ -193,12 +209,143 @@ def main() -> int:
     check("全部退订后上游退订频道 5",
           wait_until(lambda: not source_state()["5"]["subscribed"]))
 
-    # ---------------- 场景 7: 无残留订阅 ----------------
-    print("\n== 场景 7: 收尾检查 ==")
+    # ---------------- 场景 7: 共享缓存只存一份 ----------------
+    print("\n== 场景 7: 同看一个频道, 节目包只缓存一份, 未读进度记录不随积压增长 ==")
+    source_config(6, interval=0.5)  # 先慢速发包, 便于对齐两台未读起点
+    select("stb-r1", 6)
+    select("stb-r2", 6)
+    check("stb-r1 切换到频道 6", wait_until(lambda: status("stb-r1")["current_channel"] == 6))
+    check("stb-r2 切换到频道 6", wait_until(lambda: status("stb-r2")["current_channel"] == 6))
+    drain_aligned("stb-r1", "stb-r2")  # 对齐两台未读起点
+    source_config(6, interval=0.1)
+    time.sleep(2.0)  # 两台都不读, 各积压约 20 个包
+    s1, s2 = status("stb-r1"), status("stb-r2")
+    n1, n2 = s1["queued_packets"], s2["queued_packets"]
+    buf6 = proxy_state()["channels"]["6"]["buffered_packets"]  # 读状态期间仍陆续来包, 允许少量误差
+    check("两台各自积压未读包", n1 >= 5 and n2 >= 5, f"r1={n1} r2={n2}")
+    stbs_st = proxy_state()["stbs"]
+    check("每台未读进度记录条数不随积压增长 (各 1 段)",
+          stbs_st["stb-r1"]["tracked_windows"] == 1 and stbs_st["stb-r2"]["tracked_windows"] == 1,
+          f"r1={stbs_st['stb-r1']['tracked_windows']} r2={stbs_st['stb-r2']['tracked_windows']}")
+    check("频道缓存只存一份 (≈单机未读数, 而非两台之和)",
+          buf6 <= max(n1, n2) + 5 and buf6 < n1 + n2,
+          f"buffered={buf6} r1={n1} r2={n2}")
+
+    # ---------------- 场景 8: 快慢读互不影响, 读净后缓存释放 ----------------
+    print("\n== 场景 8: 快读读走只影响本机, 慢读仍能读到同样的包 ==")
+    p1 = drain("stb-r1")  # 快读者读走全部积压
+    check("stb-r1 (快) 读走全部积压", len(p1) >= 5, f"got {len(p1)}")
+    check("stb-r1 读走后 stb-r2 的未读不丢",
+          status("stb-r2")["queued_packets"] >= n2, f"r2={status('stb-r2')['queued_packets']} 之前={n2}")
+    p2 = drain("stb-r2")  # 慢读者随后读
+    seqs1, seqs2 = [p["seq"] for p in p1], [p["seq"] for p in p2]
+    check("stb-r2 (慢) 仍能读到 stb-r1 读过的同样的包",
+          seqs2[: len(seqs1)] == seqs1, f"r1={seqs1} r2={seqs2}")
+    check("慢读到的包按到包顺序 (seq 递增)", seqs2 == sorted(seqs2), f"r2={seqs2}")
+    unsubscribe("stb-r1")
+    unsubscribe("stb-r2")
+    drain("stb-r1")
+    drain("stb-r2")
+    check("无人收看且没有待取的包后缓存释放",
+          wait_until(lambda: proxy_state()["channels"]["6"]["buffered_packets"] == 0))
+    check("无人收看后上游退订频道 6",
+          wait_until(lambda: not source_state()["6"]["subscribed"]))
+
+    # ---------------- 场景 9: 换台/退订后仍能读取旧包 ----------------
+    print("\n== 场景 9: 换台/退订后仍能读取旧包, 他人读包不会提前清掉 ==")
+    unsubscribe("stb-f")  # 场景 5 的 stb-f 仍在看频道 1, 先清场以免影响缓存释放检查
+    for sid in ("stb-a", "stb-b", "stb-e", "stb-f"):
+        drain(sid)  # 清掉各台在频道 1 的残余未读旧包 (它们按规定仍可读, 不清会钉住共享缓存)
+    select("stb-s1", 1)
+    select("stb-s2", 1)
+    wait_until(lambda: status("stb-s1")["current_channel"] == 1)
+    wait_until(lambda: status("stb-s2")["current_channel"] == 1)
+    drain("stb-s1")
+    drain("stb-s2")
+    time.sleep(1.2)  # 频道 1 积压约 2 包
+    select("stb-s1", 3)  # stb-s1 换台 (频道 3 无首包延迟)
+    check("stb-s1 换到频道 3", wait_until(lambda: status("stb-s1")["current_channel"] == 3))
+    time.sleep(0.8)  # 新频道积压
+    drain("stb-s2")  # 他人读走频道 1 的包, 不应清掉 stb-s1 的旧包
+    check("他人读包后 stb-s1 的旧包仍留在缓存",
+          proxy_state()["channels"]["1"]["buffered_packets"] > 0,
+          f"buffered={proxy_state()['channels']['1']['buffered_packets']}")
+    pkts = drain("stb-s1")
+    idx1 = [i for i, p in enumerate(pkts) if p["channel"] == 1]
+    idx3 = [i for i, p in enumerate(pkts) if p["channel"] == 3]
+    check("换台后仍能读到旧频道 1 的未读包", len(idx1) >= 1, f"ch1={len(idx1)}")
+    check("同时收到新频道 3 的包", len(idx3) >= 1, f"ch3={len(idx3)}")
+    check("跨频道按到包顺序返回 (旧台包在前)",
+          bool(idx1) and bool(idx3) and max(idx1) < min(idx3),
+          f"idx1={idx1} idx3={idx3}")
+    check("包字段保持原格式 (含 received_at/seq/payload)",
+          all("received_at" in p and "seq" in p and "payload" in p for p in pkts))
+    time.sleep(0.8)
+    unsubscribe("stb-s2")  # 退订时频道 1 尚有未读包
+    pkts2 = drain("stb-s2")
+    check("退订后仍能读取退订前的未读旧包", any(p["channel"] == 1 for p in pkts2),
+          f"got {len(pkts2)}")
+    unsubscribe("stb-s1")
+    drain("stb-s1")
+    check("旧包读净后频道 1 缓存释放",
+          wait_until(lambda: proxy_state()["channels"]["1"]["buffered_packets"] == 0))
+
+    # ---------------- 场景 10: MAX_QUEUE 超限丢本机最早的包 ----------------
+    print("\n== 场景 10: MAX_QUEUE 限制本机未读, 超限丢最旧, 不影响他机 ==")
+    max_queue = int(os.getenv("PROXY_MAX_QUEUE", "200"))
+    source_config(7, interval=0.05)
+    select("stb-q1", 7)
+    select("stb-q2", 7)
+    wait_until(lambda: status("stb-q1")["current_channel"] == 7)
+    wait_until(lambda: status("stb-q2")["current_channel"] == 7)
+    drain("stb-q1")
+    drain("stb-q2")
+    # stb-q1 不读, 等积压顶到上限; stb-q2 持续快读验证不受拖累
+    q2_seqs: list[int] = []
+    deadline = time.time() + 25.0
+    capped = False
+    while time.time() < deadline:
+        q2_seqs.extend(p["seq"] for p in drain("stb-q2"))
+        if status("stb-q1")["queued_packets"] >= max_queue:
+            capped = True
+            break
+        time.sleep(0.5)
+    check(f"stb-q1 未读数顶到上限 MAX_QUEUE={max_queue}", capped,
+          f"queued={status('stb-q1')['queued_packets']}")
+    time.sleep(1.0)  # 继续来包, 触发溢出丢弃
+    q2_seqs.extend(p["seq"] for p in drain("stb-q2"))
+    check("未读数保持上限不再增长", status("stb-q1")["queued_packets"] == max_queue,
+          f"queued={status('stb-q1')['queued_packets']}")
+    pkts = drain("stb-q1")
+    seqs = [p["seq"] for p in pkts]
+    check("读出数量等于上限", len(pkts) == max_queue, f"got {len(pkts)}")
+    check("最旧的包已被丢弃 (最早 seq 已后移)", bool(seqs) and seqs[0] > 1,
+          f"first seq={seqs[0] if seqs else None}")
+    check("剩余包连续无空洞", seqs == list(range(seqs[0], seqs[0] + len(seqs))),
+          f"head={seqs[:3]} tail={seqs[-3:]}")
+    check("频道缓存同样只有一份 (≈上限而非两倍)",
+          proxy_state()["channels"]["7"]["buffered_packets"] <= max_queue + 5,
+          f"buffered={proxy_state()['channels']['7']['buffered_packets']}")
+    check("快读的 stb-q2 不受 stb-q1 溢出拖累 (seq 连续无丢失)",
+          q2_seqs == list(range(q2_seqs[0], q2_seqs[0] + len(q2_seqs))),
+          f"got {len(q2_seqs)} pkts, head={q2_seqs[:3]}")
+    unsubscribe("stb-q1")
+    unsubscribe("stb-q2")
+    drain("stb-q1")
+    drain("stb-q2")
+
+    # ---------------- 场景 11: 无残留订阅与缓存 ----------------
+    print("\n== 场景 11: 收尾检查 ==")
     for sid in ("stb-c", "stb-d", "stb-e", "stb-f"):
         unsubscribe(sid)
     check("所有频道上游均已退订",
           wait_until(lambda: all(not c["subscribed"] for c in source_state().values()), timeout=4.0))
+    for sid in ("stb-a", "stb-b", "stb-c", "stb-d", "stb-e", "stb-f", "stb-g", "stb-h"):
+        drain(sid)  # 读净各台残余未读, 缓存应全部释放
+    check("所有频道缓存已释放",
+          wait_until(lambda: all(c["buffered_packets"] == 0
+                                 for c in proxy_state()["channels"].values()), timeout=4.0),
+          str({n: c["buffered_packets"] for n, c in proxy_state()["channels"].items()}))
 
     print()
     if failures:
